@@ -1,21 +1,34 @@
 # @pipeworx/ntsb-investigations
 
-NTSB aviation accident/incident investigations, searchable by aircraft
-registration (tail number) or by make/model. Returns NTSB number, event date,
-location, injury level, phase/occurrence, probable cause, findings, and the
-NTSB docket link for each match.
+NTSB aviation accident/incident investigations — plane crashes — searchable
+by aircraft registration (tail number), make/model, or by date range/state/
+injury level across every make. Returns NTSB number, event date, location,
+injury level, phase/occurrence, probable cause, findings, and the NTSB docket
+link for each match.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1721+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1877+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
-- `ntsb_search_investigations({ registration?, make?, model?, year?, state?, limit? })`
+- `ntsb_search_investigations({ registration?, make?, model?, year?, state?, injury_level?, limit? })`
   — requires `registration` or `make`. `model` narrows within a make (matches
   "172", "172S", "172N", ... by prefix). `year` filters by event year, and is
   also how a registration match is narrowed when an N-number has been
-  reassigned to a different aircraft over time (see below). Returns
-  `{ found, data_as_of, source, count, query, results[] }`, or
-  `{ found: false, data_as_of, source, query }` with no matches.
+  reassigned to a different aircraft over time (see below). `injury_level`
+  (`fatal`, `serious`, `minor`, `none`) filters by the event's highest
+  reported injury. Returns `{ found, data_as_of, source, count, query,
+  results[] }`, or `{ found: false, data_as_of, source, query }` with no
+  matches.
+- `ntsb_accidents_by_period({ from, to?, state?, injury_level?, limit? })` —
+  aviation accidents/incidents in a date range, ACROSS every aircraft make
+  (no `make`/`registration` needed). Answers "fatal aviation accidents in
+  Alaska in 2025", "plane crashes by state in May 2024", etc. in one call.
+  `from`/`to` accept `"YYYY"`, `"YYYY-MM"`, or `"YYYY-MM-DD"` and are both
+  inclusive; `to` defaults to the end of `from`'s own year/month when
+  omitted. A range spanning more than 8 calendar years is refused — narrow
+  it. Returns `{ found, data_as_of, source, count, truncated, query,
+  by_state: [{ state, count }], results[] }` — `by_state` covers every
+  match regardless of the `limit` on `results`.
 
 ## Auth
 
@@ -74,9 +87,18 @@ rather than writing one object:
 - `ntsb/by-registration.json` — normalised registration -> the `(make, year)`
   pairs it appears under, so a registration query knows which shard(s) to
   read without a full scan.
+- `ntsb/by-year/<YYYY>.json` — one array per event year, ACROSS every make.
+  The by-make shards above are keyed on make first, so a cross-make question
+  ("fatal accidents in Alaska in 2025") would need every make's shard to
+  answer from them; this orthogonal index answers it with one read per year
+  in the requested range instead. Split further into
+  `ntsb/by-year/<YYYY>/<MM>.json` only if a single year's shard ever exceeds
+  the same ~4 MB threshold (not observed at this pull — years are well under
+  2 MB each).
 - `ntsb/manifest.json` — `data_as_of`, `source`, `record_count`, and for every
-  make the exact shard shape (`flat` / `by_year` + its years / `bucket`), so
-  the read path never has to probe R2 to find out which key a make lives in.
+  make the exact shard shape (`flat` / `by_year` + its years / `bucket`), plus
+  a parallel `years` map for the by-year shards, so the read path never has
+  to probe R2 to find out which key lives where.
 
 This replaced an earlier single-object design (`ntsb/aviation-cases.json`,
 ~27 MB) that re-fetched and parsed the whole dataset on every call with no
@@ -110,6 +132,17 @@ of year-shards, the tool refuses with a message asking for `year` (or
 `model`, which does not change which shards get read but narrows the point
 of asking) instead of silently doing the larger read. A make/model/year
 combination, or an uncommon make on its own, is unaffected.
+
+### Date-range / cross-make queries
+
+`ntsb_search_investigations` is keyed on make/registration, so there is no
+bounded way to answer "accidents in Alaska in 2025" or "fatal crashes in May
+2024" from it without naming a make first. `ntsb_accidents_by_period` reads
+the orthogonal `by-year` index instead: one shard read per calendar year the
+`from`/`to` range touches (at most 8), then filters in memory by `state` and
+`injury_level` and groups the result by state. A range spanning more than 8
+calendar years is refused — narrow it to answer in a bounded number of
+reads.
 
 ## Quick Start
 
@@ -155,7 +188,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1721+ data sources. The
+Both URLs reach the same gateway and the same 1877+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

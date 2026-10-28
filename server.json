@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.pipeworx-io/ntsb-investigations",
   "title": "Ntsb Investigations",
-  "description": "NTSB Investigations — aviation accident/incident investigations by",
-  "version": "0.1.0",
+  "description": "NTSB Investigations — aviation accident/incident investigations by registration (tail) number or…",
+  "version": "0.1.1",
   "websiteUrl": "https://pipeworx.io/packs/ntsb-investigations",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-ntsb-investigations",

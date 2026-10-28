@@ -146,6 +146,14 @@ const MAX_YEAR_SHARD_FANOUT = 8;
 // unbounded fan-out.
 const MAX_REG_SHARDS = 8;
 
+// Past this many distinct calendar years, a date-range query for
+// ntsb_accidents_by_period is refused rather than fanning out across that
+// many by-year shards — ask for a narrower range instead.
+const MAX_PERIOD_YEAR_FANOUT = 8;
+// Cap on individual records returned by ntsb_accidents_by_period. The
+// per-state counts in `by_state` always reflect every match, capped or not.
+const MAX_PERIOD_RESULTS = 200;
+
 interface R2Like {
   get(key: string): Promise<{ text(): Promise<string> } | null>;
 }
@@ -155,12 +163,19 @@ type ShardRef =
   | { type: 'by_year'; slug: string; years: string[] }
   | { type: 'bucket'; bucket: number };
 
+type YearShardRef = { type: 'flat' } | { type: 'by_month'; months: string[] };
+
 interface Manifest {
   data_as_of: string;
   source: string;
   record_count: number;
   shard_count: number;
   makes: Record<string, ShardRef>;
+  /** Cross-make index for date-range/state/injury-level queries (fleet
+   *  #3285) — absent on a manifest built before this field existed, so
+   *  callers must treat a missing `years` map as "no period data yet", not
+   *  throw. */
+  years?: Record<string, YearShardRef>;
 }
 
 type RegIndex = Record<string, { make: string; year: number | null }[]>;
@@ -269,6 +284,38 @@ function yearShardKey(ref: { slug: string }, year: string): string {
   return `ntsb/by-make/${ref.slug}/${year}.json`;
 }
 
+function byYearShardKey(year: string): string {
+  return `ntsb/by-year/${year}.json`;
+}
+
+function byYearMonthShardKey(year: string, month: string): string {
+  return `ntsb/by-year/${year}/${month}.json`;
+}
+
+/** Normalize a date-range endpoint to a full "YYYY-MM-DD" bound. Accepts
+ *  "YYYY", "YYYY-MM", or "YYYY-MM-DD" and widens to the given edge of the
+ *  period ("start" -> Jan 1 / day 01, "end" -> Dec 31 / day 31). The day-31
+ *  upper bound is safe even for shorter months — it is only ever used in a
+ *  lexicographic string comparison against real ISO event dates, none of
+ *  which is an invalid calendar date, so "2024-02-15" <= "2024-02-31" still
+ *  resolves correctly without any calendar-aware day-count logic. */
+function widenDateBound(input: string, edge: 'start' | 'end'): string | null {
+  const m = /^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?$/.exec(input.trim());
+  if (!m) return null;
+  const [, y, mo, d] = m;
+  if (d) return `${y}-${mo}-${d}`;
+  if (mo) return `${y}-${mo}-${edge === 'start' ? '01' : '31'}`;
+  return `${y}-${edge === 'start' ? '01-01' : '12-31'}`;
+}
+
+function yearsInRange(startBound: string, endBound: string): string[] {
+  const startY = Number(startBound.slice(0, 4));
+  const endY = Number(endBound.slice(0, 4));
+  const years: string[] = [];
+  for (let y = startY; y <= endY; y++) years.push(String(y));
+  return years;
+}
+
 /** Resolve ONE registration-index entry (which already pins an exact
  *  make + year, or null year for "event date unknown" — refresh.mjs's
  *  'unknown' bucket) to exactly one shard key. Unlike shardsForMake, this
@@ -356,14 +403,17 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'ntsb_search_investigations',
     description:
-      'NTSB aviation accident/incident investigations, by aircraft registration (tail) ' +
-      'number or by make/model. Returns NTSB number, event date, location, injury level, ' +
-      'phase/occurrence, probable cause, findings, and the NTSB docket link for each match. ' +
-      'Registration numbers (N-numbers) are reused over time by different aircraft; pass ' +
-      '`year` to narrow a registration match to one incarnation when more than one comes ' +
-      'back. A broad make with no `model` or `year` may be asked to narrow — this reads a ' +
-      'small sharded dataset, never a full scan. Sourced from the NTSB\'s own eADMS aviation ' +
-      'accident database (data.ntsb.gov/avdata).',
+      'NTSB aviation accident/incident investigations — plane crashes — by aircraft ' +
+      'registration (tail) number or by make/model, optionally filtered by `state`, `year`, ' +
+      'or `injury_level` (fatal, serious, minor, none). Returns NTSB number, event date, ' +
+      'location, injury level, phase/occurrence, probable cause, findings, and the NTSB docket ' +
+      'link for each match. Registration numbers (N-numbers) are reused over time by different ' +
+      'aircraft; pass `year` to narrow a registration match to one incarnation when more than ' +
+      'one comes back. A broad make with no `model` or `year` may be asked to narrow — this ' +
+      'reads a small sharded dataset, never a full scan. For a date-range or cross-make query ' +
+      'with no make/registration (e.g. "fatal accidents in Alaska in 2025"), use ' +
+      '`ntsb_accidents_by_period` instead. Sourced from the NTSB\'s own eADMS aviation accident ' +
+      'database (data.ntsb.gov/avdata).',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -372,6 +422,11 @@ const tools: McpToolExport['tools'] = [
         model: { type: 'string', description: 'Aircraft model, e.g. "172" (matches "172", "172S", "172N", ...). Requires `make`.' },
         year: { type: 'integer', description: 'Limit to events in this calendar year. Required for a common make (e.g. Cessna, Piper) unless `model` is also given.' },
         state: { type: 'string', description: 'US state postal abbreviation of the event location, e.g. "CA".' },
+        injury_level: {
+          type: 'string',
+          enum: ['fatal', 'serious', 'minor', 'none'],
+          description: 'Highest injury level reported for the event: fatal, serious, minor, or none.',
+        },
         limit: { type: 'integer', description: 'Max results to return (default 25, max 100).' },
       },
     },
@@ -383,6 +438,73 @@ const tools: McpToolExport['tools'] = [
         source: { type: 'string' },
         count: { type: 'integer' },
         query: { type: 'object' },
+        results: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              ntsb_number: { type: ['string', 'null'] },
+              event_date: { type: ['string', 'null'] },
+              location: { type: 'object' },
+              registration: { type: ['string', 'null'] },
+              aircraft: { type: 'object' },
+              damage: { type: ['string', 'null'] },
+              injury_level: { type: ['string', 'null'] },
+              occurrence: { type: ['string', 'null'] },
+              probable_cause: { type: ['string', 'null'] },
+              findings: { type: 'array' },
+              docket_url: { type: ['string', 'null'] },
+            },
+          },
+        },
+      },
+      required: ['found', 'data_as_of', 'source'],
+    },
+  },
+  {
+    name: 'ntsb_accidents_by_period',
+    description:
+      'NTSB aviation accidents and incidents — plane crashes — in a date range, across every ' +
+      'aircraft make, grouped by US state with counts. Answers questions like "fatal aviation ' +
+      'accidents in Alaska in 2025", "plane crashes by state in May 2024", or "how many fatal ' +
+      'crashes in California last year" in one call. Filter by `injury_level` (fatal, serious, ' +
+      'minor, none) and/or `state`; `from`/`to` accept "YYYY", "YYYY-MM", or "YYYY-MM-DD" and ' +
+      'are both inclusive (`to` defaults to the end of `from`\'s own year/month). Returns ' +
+      'per-state counts (`by_state`) for every match plus up to 200 individual records — NTSB ' +
+      'number, event date, location, injury level, phase, probable cause, docket link. Sourced ' +
+      'from the NTSB\'s own eADMS aviation accident database (data.ntsb.gov/avdata); a range ' +
+      'spanning more than 8 calendar years is refused — narrow it.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        from: { type: 'string', description: 'Start of the date range, inclusive. "YYYY", "YYYY-MM", or "YYYY-MM-DD", e.g. "2024-05" or "2025-01-01".' },
+        to: { type: 'string', description: 'End of the date range, inclusive, same formats as `from`. Omit to default to the end of `from`\'s own year/month.' },
+        state: { type: 'string', description: 'US state postal abbreviation of the event location, e.g. "AK".' },
+        injury_level: {
+          type: 'string',
+          enum: ['fatal', 'serious', 'minor', 'none'],
+          description: 'Highest injury level reported for the event: fatal, serious, minor, or none.',
+        },
+        limit: { type: 'integer', description: 'Max individual records to return (default 50, max 200). `by_state` counts cover every match regardless of this cap.' },
+      },
+      required: ['from'],
+    },
+    outputSchema: {
+      type: 'object' as const,
+      properties: {
+        found: { type: 'boolean' },
+        data_as_of: { type: 'string' },
+        source: { type: 'string' },
+        count: { type: 'integer' },
+        truncated: { type: 'boolean' },
+        query: { type: 'object' },
+        by_state: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: { state: { type: ['string', 'null'] }, count: { type: 'integer' } },
+          },
+        },
         results: {
           type: 'array',
           items: {
@@ -456,6 +578,42 @@ async function searchByMake(
   return shardArrays.flat().filter((c) => makeNormSet.has(normalize(c.make)) && filterRest(c));
 }
 
+/**
+ * Read every by-year shard needed to cover [startBound, endBound] and
+ * return the flattened, filtered cases. A `years` entry split `by_month`
+ * (defensive headroom only — see refresh.mjs's shardByYear) is read in full
+ * rather than month-by-month: still bounded (at most 12 extra reads for
+ * that one year), just not as tight as the common `flat` case.
+ */
+async function searchByPeriod(
+  r2: R2Like,
+  manifest: Manifest,
+  startBound: string,
+  endBound: string,
+  filterRest: (c: NtsbCase) => boolean,
+): Promise<NtsbCase[] | 'needs_narrowing'> {
+  const years = yearsInRange(startBound, endBound);
+  if (years.length > MAX_PERIOD_YEAR_FANOUT) return 'needs_narrowing';
+
+  const yearManifest = manifest.years ?? {};
+  const keysNeeded = new Set<string>();
+  for (const y of years) {
+    const ref = yearManifest[y];
+    if (!ref) continue; // no data for this year — a real (empty) answer, not a failure
+    if (ref.type === 'flat') {
+      keysNeeded.add(byYearShardKey(y));
+    } else {
+      for (const m of ref.months) keysNeeded.add(byYearMonthShardKey(y, m));
+    }
+  }
+  if (keysNeeded.size === 0) return [];
+
+  const shardArrays = await Promise.all([...keysNeeded].map((k) => loadShard(r2, k)));
+  return shardArrays
+    .flat()
+    .filter((c) => c.event_date != null && c.event_date >= startBound && c.event_date <= endBound && filterRest(c));
+}
+
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
   switch (name) {
     case 'ntsb_search_investigations': {
@@ -464,6 +622,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       const model = typeof args.model === 'string' ? args.model : undefined;
       const year = typeof args.year === 'number' ? args.year : undefined;
       const state = typeof args.state === 'string' ? args.state : undefined;
+      const injuryLevel = typeof args.injury_level === 'string' ? args.injury_level : undefined;
       const limit = Math.min(Math.max(1, typeof args.limit === 'number' ? args.limit : 25), 100);
 
       if (!registration && !make) {
@@ -476,14 +635,16 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       const manifest = await loadManifest(r2);
       const modelNorm = model ? normalize(model) : null;
       const stateNorm = state ? normalize(state) : null;
+      const injuryNorm = injuryLevel ? normalize(injuryLevel) : null;
       const filterRest = (c: NtsbCase) => {
         if (modelNorm && !normalize(c.model).startsWith(modelNorm)) return false;
         if (stateNorm && normalize(c.state) !== stateNorm) return false;
+        if (injuryNorm && normalize(c.injury_level) !== injuryNorm) return false;
         if (year && c.event_date && !c.event_date.startsWith(String(year))) return false;
         return true;
       };
 
-      const query = { registration, make, model, year, state };
+      const query = { registration, make, model, year, state, injury_level: injuryLevel };
 
       const matches = registration
         ? await searchByRegistration(r2, manifest, registration, year, filterRest)
@@ -515,6 +676,81 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         source: SOURCE_URL,
         count: matches.length,
         query,
+        results: page.map(toResult),
+      };
+    }
+    case 'ntsb_accidents_by_period': {
+      const from = typeof args.from === 'string' ? args.from : undefined;
+      const to = typeof args.to === 'string' ? args.to : undefined;
+      const state = typeof args.state === 'string' ? args.state : undefined;
+      const injuryLevel = typeof args.injury_level === 'string' ? args.injury_level : undefined;
+      const limit = Math.min(Math.max(1, typeof args.limit === 'number' ? args.limit : 50), MAX_PERIOD_RESULTS);
+
+      if (!from) throw new Error('ntsb_accidents_by_period requires `from`.');
+
+      const startBound = widenDateBound(from, 'start');
+      if (!startBound) {
+        throw new Error(`ntsb_accidents_by_period: \`from\` ("${from}") is not "YYYY", "YYYY-MM", or "YYYY-MM-DD".`);
+      }
+      const endBound = widenDateBound(to ?? from, 'end');
+      if (!endBound) {
+        throw new Error(`ntsb_accidents_by_period: \`to\` ("${to}") is not "YYYY", "YYYY-MM", or "YYYY-MM-DD".`);
+      }
+      if (endBound < startBound) {
+        throw new Error('ntsb_accidents_by_period: `to` is before `from`.');
+      }
+
+      const r2 = r2FromArgs(args);
+      if (!r2) return DATASET_UNAVAILABLE;
+
+      const manifest = await loadManifest(r2);
+      if (!manifest.years) {
+        throw new Error(
+          'ntsb_accidents_by_period: this dataset build has no by-year index yet — run ' +
+            'scripts/refresh.mjs in mcps/ntsb-investigations.',
+        );
+      }
+      const stateNorm = state ? normalize(state) : null;
+      const injuryNorm = injuryLevel ? normalize(injuryLevel) : null;
+      const filterRest = (c: NtsbCase) => {
+        if (stateNorm && normalize(c.state) !== stateNorm) return false;
+        if (injuryNorm && normalize(c.injury_level) !== injuryNorm) return false;
+        return true;
+      };
+
+      const query = { from, to, state, injury_level: injuryLevel };
+
+      const matches = await searchByPeriod(r2, manifest, startBound, endBound, filterRest);
+      if (matches === 'needs_narrowing') {
+        throw new Error(
+          `ntsb_accidents_by_period: this range spans more than ${MAX_PERIOD_YEAR_FANOUT} calendar ` +
+            'years — narrow `from`/`to` to a tighter range.',
+        );
+      }
+
+      if (matches.length === 0) {
+        return { found: false, data_as_of: manifest.data_as_of, source: SOURCE_URL, query, count: 0, by_state: [], results: [] };
+      }
+
+      const byStateCounts = new Map<string, number>();
+      for (const c of matches) {
+        const st = c.state ?? 'UNKNOWN';
+        byStateCounts.set(st, (byStateCounts.get(st) ?? 0) + 1);
+      }
+      const by_state = [...byStateCounts.entries()]
+        .map(([st, count]) => ({ state: st, count }))
+        .sort((a, b) => b.count - a.count || a.state.localeCompare(b.state));
+
+      matches.sort((a, b) => (b.event_date ?? '').localeCompare(a.event_date ?? ''));
+      const page = matches.slice(0, limit);
+      return {
+        found: true,
+        data_as_of: manifest.data_as_of,
+        source: SOURCE_URL,
+        count: matches.length,
+        truncated: matches.length > page.length,
+        query,
+        by_state,
         results: page.map(toResult),
       };
     }
