@@ -1,12 +1,20 @@
 {
   "name": "@pipeworx/mcp-ntsb-investigations",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "NTSB Investigations — aviation accident/incident investigations by registration (tail) number or aircraft make/model. Fleet #2791.",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools.json": "./tools.json",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "mcp-ntsb-investigations": "bin/cli.js"
+  },
+  "files": ["bin/", "lib/", "tools.json", "server.json"],
+  "engines": {
+    "node": ">=18"
   },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "ntsb-investigations"],
   "license": "MIT",
@@ -14,19 +22,12 @@
     "type": "git",
     "url": "git+https://github.com/pipeworx-io/mcp-ntsb-investigations.git"
   },
-  "scripts": {
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "tsx": "^4.19.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "@cloudflare/workers-types": "^4.20260405.1"
-  },
+  "mcpName": "io.github.pipeworx-io/ntsb-investigations",
   "pipeworx": {
-    "sourceHash": "v1-24bae9035c050f43842a10707d542d4462407fb470c8012e8c03a5899b43bcd3",
-    "sourceCommit": "774de7f685a75e02d0b828d24a7b94794102152c"
+    "mode": "gateway",
+    "slug": "ntsb-investigations",
+    "gatewaySlug": "ntsb-investigations",
+    "sourceHash": "v1-8a477b8036dbf901dd121537bc6fbb6a40f3fe86512536cac0faacbc13992aea",
+    "sourceCommit": "b2c4383545bb35171d0ada2beb1c9c7168ea175e"
   }
 }
