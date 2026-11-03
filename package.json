@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-ntsb-investigations",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "NTSB Investigations — aviation accident/incident investigations by registration (tail) number or aircraft make/model. Fleet #2791.",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "ntsb-investigations",
     "gatewaySlug": "ntsb-investigations",
-    "sourceHash": "v1-8a477b8036dbf901dd121537bc6fbb6a40f3fe86512536cac0faacbc13992aea",
-    "sourceCommit": "b2c4383545bb35171d0ada2beb1c9c7168ea175e"
+    "sourceHash": "v1-0a6cc6b452704009bef776682da482074806dbc3745836c17518b8fd25742372",
+    "sourceCommit": "bed7faa04e7276899b5e3870ef11c98625371f2b"
   }
 }
